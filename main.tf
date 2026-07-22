@@ -2,16 +2,13 @@ provider "aws" {
   region = "us-east-1"
 }
 
-resource "aws_default_vpc" "default" {}
-
-resource "aws_default_subnet" "az" {
-  for_each          = toset(["us-east-1a", "us-east-1b"])
-  availability_zone = each.key
+module "vpc" {
+  source = "./modules/vpc"
 }
 
 resource "aws_security_group" "web" {
   name   = "amazon-web-sg"
-  vpc_id = aws_default_vpc.default.id
+  vpc_id = module.vpc.vpc_id
 
   ingress {
     from_port   = 80
@@ -27,16 +24,14 @@ resource "aws_security_group" "web" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
-
-resource "aws_instance" "ec2_module" {
-  for_each      = toset(["us-east-1a", "us-east-1b"])
-  ami           = "ami-01edba92f9036f76e"
+resource "aws_launch_template" "web" {
+  name_prefix   = "amazon-lt-"
+  image_id      = "ami-01edba92f9036f76e"
   instance_type = "t3.micro"
 
-  subnet_id              = aws_default_subnet.az[each.key].id
   vpc_security_group_ids = [aws_security_group.web.id]
 
-  user_data = <<-EOF
+  user_data = base64encode(<<-EOF
     #!/bin/bash
     sudo yum install httpd git -y
     sudo systemctl start httpd
@@ -44,18 +39,17 @@ resource "aws_instance" "ec2_module" {
     sudo git clone https://github.com/Ironhack-Archive/online-clone-amazon.git
     sudo mv online-clone-amazon/* /var/www/html
   EOF
-
-  tags = {
-    Name = "ec2-module-${each.key}"
-  }
+  )
 }
+
+
 
 resource "aws_lb" "app" {
   name            = "amazon-alb"
   security_groups = [aws_security_group.web.id]
   subnets = [
-    aws_default_subnet.az["us-east-1a"].id,
-    aws_default_subnet.az["us-east-1b"].id,
+    module.vpc.public_subnet_1_id,
+    module.vpc.public_subnet_2_id,
   ]
 }
 
@@ -63,14 +57,7 @@ resource "aws_lb_target_group" "app" {
   name     = "amazon-tg"
   port     = 80
   protocol = "HTTP"
-  vpc_id   = aws_default_vpc.default.id
-}
-
-resource "aws_lb_target_group_attachment" "app" { #registered target group for ec2 instances
-  for_each         = aws_instance.ec2_module
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = each.value.id
-  port             = 80
+  vpc_id   = module.vpc.vpc_id
 }
 
 resource "aws_lb_listener" "app" { #listeners and routing (forwards traffic to target group)
@@ -84,6 +71,41 @@ resource "aws_lb_listener" "app" { #listeners and routing (forwards traffic to t
   }
 }
 
-output "alb_dns_name" {
-  value = aws_lb.app.dns_name
+resource "aws_autoscaling_group" "web" {
+  name                = "amazon-asg"
+  vpc_zone_identifier = [module.vpc.public_subnet_1_id, module.vpc.public_subnet_2_id]
+
+  min_size         = 2
+  max_size         = 4
+  desired_capacity = 2
+
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+
+  target_group_arns = [aws_lb_target_group.app.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "asg-web"
+    propagate_at_launch = true
+  }
 }
+
+
+module "rds" {
+  source = "./modules/rds"
+
+  vpc_id              = module.vpc.vpc_id
+  private_subnet_1_id = module.vpc.private_subnet_1_id
+  private_subnet_2_id = module.vpc.private_subnet_2_id
+  web_sg_id           = aws_security_group.web.id
+
+  db_username = var.db_username
+  db_password = var.db_password
+}
+
